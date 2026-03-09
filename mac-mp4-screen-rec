@@ -1,0 +1,362 @@
+#!/bin/bash
+set -euo pipefail
+
+# mac-mp4-screen-rec — Automatically convert macOS screen recordings to MP4
+# https://github.com/arch1904/MacMp4ScreenRec
+
+VERSION="1.0.0"
+CONFIG_DIR="${HOME}/.config/mac-mp4-screen-rec"
+CONFIG_FILE="${CONFIG_DIR}/config"
+PLIST_NAME="com.mac-mp4-screen-rec.agent"
+PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
+FFMPEG="$(command -v ffmpeg 2>/dev/null || echo "")"
+
+# ─── Helpers ──────────────────────────────────────────────
+
+die() { echo "error: $1" >&2; exit 1; }
+
+ensure_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        mkdir -p "$CONFIG_DIR"
+        cat > "$CONFIG_FILE" <<'EOF'
+# mac-mp4-screen-rec config
+# Watch paths (one per line, after "paths:" line)
+paths:
+~/Desktop
+
+# Mode: "recordings-only" or "all-movs"
+mode: recordings-only
+EOF
+    fi
+}
+
+read_paths() {
+    ensure_config
+    local in_paths=false
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^#.*$ ]] && continue
+        [[ -z "$line" ]] && continue
+
+        if [[ "$line" == "paths:" ]]; then
+            in_paths=true
+            continue
+        fi
+
+        # Stop reading paths when we hit another key
+        if [[ "$line" =~ ^[a-z]+: ]]; then
+            in_paths=false
+            continue
+        fi
+
+        if $in_paths; then
+            # Expand ~ to $HOME
+            echo "${line/#\~/$HOME}"
+        fi
+    done < "$CONFIG_FILE"
+}
+
+read_mode() {
+    ensure_config
+    local mode
+    mode=$(grep '^mode:' "$CONFIG_FILE" | head -1 | sed 's/^mode:[[:space:]]*//')
+    echo "${mode:-recordings-only}"
+}
+
+write_paths() {
+    ensure_config
+    local tmp
+    tmp=$(mktemp)
+    local paths=("$@")
+
+    # Rebuild config preserving mode and comments at top
+    local mode
+    mode=$(read_mode)
+
+    cat > "$tmp" <<EOF
+# mac-mp4-screen-rec config
+# Watch paths (one per line, after "paths:" line)
+paths:
+EOF
+    for p in "${paths[@]}"; do
+        # Store with ~ for readability
+        echo "${p/#$HOME/\~}" >> "$tmp"
+    done
+
+    cat >> "$tmp" <<EOF
+
+# Mode: "recordings-only" or "all-movs"
+mode: ${mode}
+EOF
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+write_mode() {
+    ensure_config
+    local new_mode="$1"
+    local tmp
+    tmp=$(mktemp)
+    sed "s/^mode:.*/mode: ${new_mode}/" "$CONFIG_FILE" > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+# ─── Launchd plist generation ─────────────────────────────
+
+generate_plist() {
+    local paths
+    mapfile -t paths < <(read_paths)
+
+    if [ ${#paths[@]} -eq 0 ]; then
+        die "no watch paths configured. Add one with: mac-mp4-screen-rec add <path>"
+    fi
+
+    local watch_paths=""
+    for p in "${paths[@]}"; do
+        watch_paths+="        <string>${p}</string>"$'\n'
+    done
+
+    cat > "$PLIST_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_NAME}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$(command -v mac-mp4-screen-rec || echo "$0")</string>
+        <string>convert</string>
+    </array>
+    <key>WatchPaths</key>
+    <array>
+${watch_paths}    </array>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>
+EOF
+}
+
+# ─── Convert logic ────────────────────────────────────────
+
+do_convert() {
+    [ -z "$FFMPEG" ] && die "ffmpeg not found. Install it: brew install ffmpeg"
+
+    local mode
+    mode=$(read_mode)
+    local paths
+    mapfile -t paths < <(read_paths)
+
+    for dir in "${paths[@]}"; do
+        [ -d "$dir" ] || continue
+
+        for file in "$dir"/*.mov; do
+            [ -f "$file" ] || continue
+
+            # If recordings-only mode, skip non-screen-recordings
+            if [ "$mode" = "recordings-only" ]; then
+                local basename
+                basename="$(basename "$file")"
+                if [[ "$basename" != "Screen Recording"* ]]; then
+                    continue
+                fi
+            fi
+
+            # Skip if file was modified in the last 3 seconds (still being written)
+            local now mod_time age
+            now=$(date +%s)
+            mod_time=$(stat -f %m "$file")
+            age=$(( now - mod_time ))
+            if [ "$age" -lt 3 ]; then
+                continue
+            fi
+
+            local mp4_file="${file%.mov}.mp4"
+
+            # Skip if already converted
+            [ -f "$mp4_file" ] && continue
+
+            # Lossless remux
+            if "$FFMPEG" -nostdin -y -i "$file" -c copy -movflags +faststart "$mp4_file" 2>/dev/null; then
+                rm "$file"
+            fi
+        done
+    done
+}
+
+# ─── CLI commands ─────────────────────────────────────────
+
+cmd_add() {
+    local new_path="${1:?usage: mac-mp4-screen-rec add <path>}"
+    # Resolve to absolute path
+    new_path="$(cd "$new_path" 2>/dev/null && pwd)" || die "path does not exist: $1"
+
+    local paths
+    mapfile -t paths < <(read_paths)
+
+    # Check for duplicates
+    for p in "${paths[@]}"; do
+        if [ "$p" = "$new_path" ]; then
+            echo "already watching: ${new_path/#$HOME/\~}"
+            return 0
+        fi
+    done
+
+    paths+=("$new_path")
+    write_paths "${paths[@]}"
+    echo "added: ${new_path/#$HOME/\~}"
+
+    # Regenerate plist if service is running
+    if launchctl list "$PLIST_NAME" &>/dev/null; then
+        echo "restarting service to pick up changes..."
+        cmd_stop
+        cmd_start
+    fi
+}
+
+cmd_remove() {
+    local rm_path="${1:?usage: mac-mp4-screen-rec remove <path>}"
+    rm_path="$(cd "$rm_path" 2>/dev/null && pwd)" || rm_path="${rm_path/#\~/$HOME}"
+
+    local paths new_paths=()
+    mapfile -t paths < <(read_paths)
+    local found=false
+
+    for p in "${paths[@]}"; do
+        if [ "$p" = "$rm_path" ]; then
+            found=true
+        else
+            new_paths+=("$p")
+        fi
+    done
+
+    if ! $found; then
+        die "not watching: ${rm_path/#$HOME/\~}"
+    fi
+
+    if [ ${#new_paths[@]} -eq 0 ]; then
+        write_paths ""
+    else
+        write_paths "${new_paths[@]}"
+    fi
+    echo "removed: ${rm_path/#$HOME/\~}"
+
+    if launchctl list "$PLIST_NAME" &>/dev/null; then
+        echo "restarting service to pick up changes..."
+        cmd_stop
+        cmd_start
+    fi
+}
+
+cmd_list() {
+    ensure_config
+    echo "mac-mp4-screen-rec v${VERSION}"
+    echo ""
+    echo "Watch paths:"
+    local paths
+    mapfile -t paths < <(read_paths)
+    if [ ${#paths[@]} -eq 0 ]; then
+        echo "  (none)"
+    else
+        for p in "${paths[@]}"; do
+            echo "  ${p/#$HOME/\~}"
+        done
+    fi
+    echo ""
+    echo "Mode: $(read_mode)"
+}
+
+cmd_config() {
+    case "${1:-}" in
+        --all-movs)
+            write_mode "all-movs"
+            echo "mode set to: all-movs (converting all .mov files)"
+            ;;
+        --only-recordings)
+            write_mode "recordings-only"
+            echo "mode set to: recordings-only (only Screen Recording*.mov)"
+            ;;
+        *)
+            echo "usage: mac-mp4-screen-rec config [--all-movs | --only-recordings]"
+            exit 1
+            ;;
+    esac
+
+    if launchctl list "$PLIST_NAME" &>/dev/null; then
+        echo "service is running — changes take effect on next trigger."
+    fi
+}
+
+cmd_start() {
+    [ -z "$FFMPEG" ] && die "ffmpeg not found. Install it: brew install ffmpeg"
+    generate_plist
+    launchctl load "$PLIST_PATH" 2>/dev/null || true
+
+    if launchctl list "$PLIST_NAME" &>/dev/null; then
+        echo "service started."
+    else
+        die "failed to start service"
+    fi
+}
+
+cmd_stop() {
+    if launchctl list "$PLIST_NAME" &>/dev/null; then
+        launchctl unload "$PLIST_PATH" 2>/dev/null || true
+        echo "service stopped."
+    else
+        echo "service is not running."
+    fi
+}
+
+cmd_status() {
+    if launchctl list "$PLIST_NAME" &>/dev/null; then
+        echo "service: running"
+    else
+        echo "service: stopped"
+    fi
+    echo ""
+    cmd_list
+}
+
+cmd_help() {
+    cat <<EOF
+mac-mp4-screen-rec v${VERSION}
+Automatically convert macOS screen recordings from MOV to MP4.
+
+Usage:
+  mac-mp4-screen-rec <command> [options]
+
+Commands:
+  add <path>             Add a directory to watch
+  remove <path>          Remove a watched directory
+  list                   Show current configuration
+  config --all-movs      Convert all .mov files
+  config --only-recordings  Only convert screen recordings (default)
+  start                  Start the background service
+  stop                   Stop the background service
+  status                 Show service status and config
+  help                   Show this help message
+  version                Show version
+
+Examples:
+  mac-mp4-screen-rec add ~/Desktop
+  mac-mp4-screen-rec config --all-movs
+  mac-mp4-screen-rec start
+EOF
+}
+
+# ─── Main ─────────────────────────────────────────────────
+
+case "${1:-help}" in
+    add)        shift; cmd_add "$@" ;;
+    remove)     shift; cmd_remove "$@" ;;
+    list)       cmd_list ;;
+    config)     shift; cmd_config "$@" ;;
+    start)      cmd_start ;;
+    stop)       cmd_stop ;;
+    status)     cmd_status ;;
+    convert)    do_convert ;;
+    help|--help|-h) cmd_help ;;
+    version|--version|-v) echo "mac-mp4-screen-rec v${VERSION}" ;;
+    *)          echo "unknown command: $1"; cmd_help; exit 1 ;;
+esac
