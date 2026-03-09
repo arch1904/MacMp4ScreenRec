@@ -14,6 +14,7 @@ FFMPEG="$(command -v ffmpeg 2>/dev/null || echo "")"
 # ─── Helpers ──────────────────────────────────────────────
 
 die() { echo "error: $1" >&2; exit 1; }
+tildify() { echo "$1" | sed "s|^${HOME}|~|"; }
 
 ensure_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
@@ -35,25 +36,31 @@ read_paths() {
     local in_paths=false
     while IFS= read -r line; do
         # Skip comments and empty lines
-        [[ "$line" =~ ^#.*$ ]] && continue
-        [[ -z "$line" ]] && continue
+        case "$line" in \#*) continue ;; esac
+        [ -z "$line" ] && continue
 
-        if [[ "$line" == "paths:" ]]; then
+        if [ "$line" = "paths:" ]; then
             in_paths=true
             continue
         fi
 
         # Stop reading paths when we hit another key
-        if [[ "$line" =~ ^[a-z]+: ]]; then
-            in_paths=false
-            continue
-        fi
+        case "$line" in *:) in_paths=false; continue ;; esac
+        case "$line" in *:\ *) in_paths=false; continue ;; esac
 
         if $in_paths; then
             # Expand ~ to $HOME
             echo "${line/#\~/$HOME}"
         fi
     done < "$CONFIG_FILE"
+}
+
+# Read paths into a bash 3.2-compatible array
+_load_paths() {
+    _paths=()
+    while IFS= read -r _p; do
+        _paths+=("$_p")
+    done < <(read_paths)
 }
 
 read_mode() {
@@ -67,7 +74,6 @@ write_paths() {
     ensure_config
     local tmp
     tmp=$(mktemp)
-    local paths=("$@")
 
     # Rebuild config preserving mode and comments at top
     local mode
@@ -78,9 +84,10 @@ write_paths() {
 # Watch paths (one per line, after "paths:" line)
 paths:
 EOF
-    for p in "${paths[@]}"; do
+    for p in "$@"; do
+        [ -z "$p" ] && continue
         # Store with ~ for readability
-        echo "${p/#$HOME/\~}" >> "$tmp"
+        tildify "$p" >> "$tmp"
     done
 
     cat >> "$tmp" <<EOF
@@ -103,15 +110,14 @@ write_mode() {
 # ─── Launchd plist generation ─────────────────────────────
 
 generate_plist() {
-    local paths
-    mapfile -t paths < <(read_paths)
+    _load_paths
 
-    if [ ${#paths[@]} -eq 0 ]; then
+    if [ ${#_paths[@]} -eq 0 ]; then
         die "no watch paths configured. Add one with: mac-mp4-screen-rec add <path>"
     fi
 
     local watch_paths=""
-    for p in "${paths[@]}"; do
+    for p in "${_paths[@]}"; do
         watch_paths+="        <string>${p}</string>"$'\n'
     done
 
@@ -144,10 +150,9 @@ do_convert() {
 
     local mode
     mode=$(read_mode)
-    local paths
-    mapfile -t paths < <(read_paths)
+    _load_paths
 
-    for dir in "${paths[@]}"; do
+    for dir in "${_paths[@]}"; do
         [ -d "$dir" ] || continue
 
         for file in "$dir"/*.mov; do
@@ -155,11 +160,12 @@ do_convert() {
 
             # If recordings-only mode, skip non-screen-recordings
             if [ "$mode" = "recordings-only" ]; then
-                local basename
-                basename="$(basename "$file")"
-                if [[ "$basename" != "Screen Recording"* ]]; then
-                    continue
-                fi
+                local bname
+                bname="$(basename "$file")"
+                case "$bname" in
+                    "Screen Recording"*) ;;
+                    *) continue ;;
+                esac
             fi
 
             # Skip if file was modified in the last 3 seconds (still being written)
@@ -191,20 +197,19 @@ cmd_add() {
     # Resolve to absolute path
     new_path="$(cd "$new_path" 2>/dev/null && pwd)" || die "path does not exist: $1"
 
-    local paths
-    mapfile -t paths < <(read_paths)
+    _load_paths
 
     # Check for duplicates
-    for p in "${paths[@]}"; do
+    for p in "${_paths[@]}"; do
         if [ "$p" = "$new_path" ]; then
-            echo "already watching: ${new_path/#$HOME/\~}"
+            echo "already watching: $(tildify "$new_path")"
             return 0
         fi
     done
 
-    paths+=("$new_path")
-    write_paths "${paths[@]}"
-    echo "added: ${new_path/#$HOME/\~}"
+    _paths+=("$new_path")
+    write_paths "${_paths[@]}"
+    echo "added: $(tildify "$new_path")"
 
     # Regenerate plist if service is running
     if launchctl list "$PLIST_NAME" &>/dev/null; then
@@ -218,11 +223,11 @@ cmd_remove() {
     local rm_path="${1:?usage: mac-mp4-screen-rec remove <path>}"
     rm_path="$(cd "$rm_path" 2>/dev/null && pwd)" || rm_path="${rm_path/#\~/$HOME}"
 
-    local paths new_paths=()
-    mapfile -t paths < <(read_paths)
+    _load_paths
+    local new_paths=()
     local found=false
 
-    for p in "${paths[@]}"; do
+    for p in "${_paths[@]}"; do
         if [ "$p" = "$rm_path" ]; then
             found=true
         else
@@ -231,7 +236,7 @@ cmd_remove() {
     done
 
     if ! $found; then
-        die "not watching: ${rm_path/#$HOME/\~}"
+        die "not watching: $(tildify "$rm_path")"
     fi
 
     if [ ${#new_paths[@]} -eq 0 ]; then
@@ -239,7 +244,7 @@ cmd_remove() {
     else
         write_paths "${new_paths[@]}"
     fi
-    echo "removed: ${rm_path/#$HOME/\~}"
+    echo "removed: $(tildify "$rm_path")"
 
     if launchctl list "$PLIST_NAME" &>/dev/null; then
         echo "restarting service to pick up changes..."
@@ -253,13 +258,12 @@ cmd_list() {
     echo "mac-mp4-screen-rec v${VERSION}"
     echo ""
     echo "Watch paths:"
-    local paths
-    mapfile -t paths < <(read_paths)
-    if [ ${#paths[@]} -eq 0 ]; then
+    _load_paths
+    if [ ${#_paths[@]} -eq 0 ]; then
         echo "  (none)"
     else
-        for p in "${paths[@]}"; do
-            echo "  ${p/#$HOME/\~}"
+        for p in "${_paths[@]}"; do
+            echo "  $(tildify "$p")"
         done
     fi
     echo ""
