@@ -2,7 +2,7 @@
 
 ## Overview
 
-Automatically convert macOS screen recordings or other configured video files in the background with `launchd` and `ffmpeg`.
+Automatically convert macOS screen recordings or other configured video files in the background with `launchd`, `ffmpeg`, and optional codec-specific override rules resolved via `ffprobe`.
 
 ## Defaults
 
@@ -10,8 +10,10 @@ Automatically convert macOS screen recordings or other configured video files in
 - Selection mode: `recordings-only`
 - Input extensions: `mov`
 - Output extension: `mp4`
-- Video codec: `copy`
-- Audio codec: `copy`
+- Default video codec: `copy`
+- Default audio codec: `copy`
+- Video codec overrides: none
+- Audio codec overrides: none
 - Original retention: `0` days
 
 ## CLI (`mac-mp4-screen-rec`)
@@ -26,8 +28,12 @@ Automatically convert macOS screen recordings or other configured video files in
 - `config --keep-original-days <days>` — keep successful originals for N days
 - `config --input-extensions <ext1,ext2,...>` — select which extensions to scan
 - `config --output-extension <ext>` — choose the output container extension
-- `config --video-codec <codec>` — set `ffmpeg -c:v`
-- `config --audio-codec <codec>` — set `ffmpeg -c:a`
+- `config --video-codec <codec>` — set the default `ffmpeg -c:v`
+- `config --audio-codec <codec>` — set the default `ffmpeg -c:a`
+- `config --map-video-codec <input=output>` — override video codec by detected source codec
+- `config --map-audio-codec <input=output>` — override audio codec by detected source codec
+- `config --remove-video-codec-map <input>` / `--remove-audio-codec-map <input>`
+- `config --clear-video-codec-maps` / `--clear-audio-codec-maps`
 - `convert` — run one immediate scan/cleanup pass
 - `start` / `stop` / `status`
 
@@ -43,6 +49,8 @@ input_extensions: mov
 output_extension: mp4
 video_codec: copy
 audio_codec: copy
+video_codec_map:
+audio_codec_map:
 ```
 
 ## Service Model
@@ -51,11 +59,15 @@ audio_codec: copy
 - `StartInterval` runs every hour so delayed original cleanup still happens when no new files arrive.
 - The job scans each watched directory root with `find -maxdepth 1`.
 - `recordings-only` mode remains name-based: only files starting with `Screen Recording` are eligible after extension filtering.
+- Resolved codecs are chosen per file:
+  - global defaults from `video_codec` / `audio_codec`
+  - optional override by detected source video/audio codec name
 
 ## Viability And Constraints
 
 - Input format support is viable because extension selection is only a discovery filter; actual decode/mux/encode support comes from the installed `ffmpeg`.
-- Codec support is viable for the same reason. The script passes configured codec names directly to `ffmpeg`.
+- Codec-specific overrides are viable because `ffprobe` exposes the source codec names and the shell layer can route to different output codecs on that basis.
+- Untouched settings remain on defaults or prior user selections. Only the explicitly matched override is replaced.
 - Container/codec mismatches are intentionally not prevalidated in shell. `ffmpeg` remains the source of truth for what combinations work.
 - Same-extension transcodes are deliberately not implemented. The current tool writes sibling outputs and then optionally deletes the source; in-place rewrites would need a different naming and retention design.
 - Delayed deletion is approximate to the hourly cleanup cadence, not exact to the second.

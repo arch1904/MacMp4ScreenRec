@@ -4,14 +4,21 @@ set -euo pipefail
 # mac-mp4-screen-rec — Automatically convert macOS screen recordings and other video files
 # https://github.com/arch1904/MacMp4ScreenRec
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 CONFIG_DIR="${HOME}/.config/mac-mp4-screen-rec"
 CONFIG_FILE="${CONFIG_DIR}/config"
 RETENTION_DIR="${CONFIG_DIR}/retention"
 PLIST_NAME="com.mac-mp4-screen-rec.agent"
 PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
 FFMPEG="$(command -v ffmpeg 2>/dev/null || echo "")"
+FFPROBE="$(command -v ffprobe 2>/dev/null || echo "")"
 CLEANUP_INTERVAL_SECONDS=3600
+_video_codec_map_inputs=()
+_video_codec_map_outputs=()
+_video_codec_map_count=0
+_audio_codec_map_inputs=()
+_audio_codec_map_outputs=()
+_audio_codec_map_count=0
 
 # ─── Helpers ──────────────────────────────────────────────
 
@@ -39,6 +46,33 @@ normalize_mode() {
         all-files|all-movs) echo "all-files" ;;
         *) echo "recordings-only" ;;
     esac
+}
+
+normalize_codec() {
+    trim "$1"
+}
+
+normalize_codec_map_key() {
+    lower "$(trim "$1")"
+}
+
+normalize_codec_map_entry() {
+    local raw="$1"
+    local input_codec output_codec
+
+    case "$raw" in
+        *=*)
+            input_codec="$(normalize_codec_map_key "${raw%%=*}")"
+            output_codec="$(normalize_codec "${raw#*=}")"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    [ -n "$input_codec" ] || return 1
+    [ -n "$output_codec" ] || return 1
+    echo "${input_codec}=${output_codec}"
 }
 
 is_nonnegative_integer() {
@@ -93,10 +127,6 @@ normalize_extensions_csv() {
     join_by_comma "${normalized[@]}"
 }
 
-normalize_codec() {
-    trim "$1"
-}
-
 read_scalar_config() {
     local key="$1"
     local default_value="$2"
@@ -135,9 +165,14 @@ input_extensions: mov
 # Output container extension
 output_extension: mp4
 
-# ffmpeg codec settings
+# Default ffmpeg codec settings
 video_codec: copy
 audio_codec: copy
+
+# Per-source codec overrides (format: input_codec=output_codec)
+video_codec_map:
+
+audio_codec_map:
 EOF
     fi
 }
@@ -162,6 +197,46 @@ read_paths() {
         if $in_paths; then
             echo "${line/#\~/$HOME}"
         fi
+    done < "$CONFIG_FILE"
+}
+
+read_codec_map_entries() {
+    local section_name="$1"
+    ensure_config
+    local in_section=false
+    local line=""
+
+    while IFS= read -r line; do
+        case "$line" in \#*) continue ;; esac
+
+        if [ "$line" = "${section_name}:" ]; then
+            in_section=true
+            continue
+        fi
+
+        case "$line" in *:\ *)
+            if $in_section; then
+                in_section=false
+            fi
+            ;;
+        esac
+        case "$line" in *:)
+            if [ "$line" != "${section_name}:" ] && $in_section; then
+                in_section=false
+            fi
+            ;;
+        esac
+
+        if ! $in_section; then
+            continue
+        fi
+
+        [ -n "$line" ] || continue
+
+        local normalized_entry
+        normalized_entry="$(normalize_codec_map_entry "$line" || true)"
+        [ -n "$normalized_entry" ] || continue
+        echo "$normalized_entry"
     done < "$CONFIG_FILE"
 }
 
@@ -225,6 +300,46 @@ read_audio_codec() {
     echo "${codec:-copy}"
 }
 
+read_video_codec_map_entries() {
+    read_codec_map_entries "video_codec_map"
+}
+
+read_audio_codec_map_entries() {
+    read_codec_map_entries "audio_codec_map"
+}
+
+read_video_codec_map_entries_blob() {
+    read_video_codec_map_entries || true
+}
+
+read_audio_codec_map_entries_blob() {
+    read_audio_codec_map_entries || true
+}
+
+_load_video_codec_map() {
+    _video_codec_map_inputs=()
+    _video_codec_map_outputs=()
+    _video_codec_map_count=0
+    while IFS= read -r _entry; do
+        [ -n "$_entry" ] || continue
+        _video_codec_map_inputs+=("${_entry%%=*}")
+        _video_codec_map_outputs+=("${_entry#*=}")
+        _video_codec_map_count=$(( _video_codec_map_count + 1 ))
+    done < <(read_video_codec_map_entries)
+}
+
+_load_audio_codec_map() {
+    _audio_codec_map_inputs=()
+    _audio_codec_map_outputs=()
+    _audio_codec_map_count=0
+    while IFS= read -r _entry; do
+        [ -n "$_entry" ] || continue
+        _audio_codec_map_inputs+=("${_entry%%=*}")
+        _audio_codec_map_outputs+=("${_entry#*=}")
+        _audio_codec_map_count=$(( _audio_codec_map_count + 1 ))
+    done < <(read_audio_codec_map_entries)
+}
+
 write_full_config() {
     local mode="$1"
     local keep_original_days="$2"
@@ -232,7 +347,9 @@ write_full_config() {
     local output_extension="$4"
     local video_codec="$5"
     local audio_codec="$6"
-    shift 6
+    local video_codec_map_entries="$7"
+    local audio_codec_map_entries="$8"
+    shift 8
     local config_paths=("$@")
     local tmp
     tmp=$(mktemp)
@@ -263,11 +380,34 @@ input_extensions: ${input_extensions_csv}
 # Output container extension
 output_extension: ${output_extension}
 
-# ffmpeg codec settings
+# Default ffmpeg codec settings
 video_codec: ${video_codec}
 audio_codec: ${audio_codec}
+
+# Per-source codec overrides (format: input_codec=output_codec)
+video_codec_map:
 EOF
 
+    if [ -n "$video_codec_map_entries" ]; then
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            printf '%s\n' "$entry" >> "$tmp"
+        done <<< "$video_codec_map_entries"
+    fi
+
+    cat >> "$tmp" <<EOF
+
+audio_codec_map:
+EOF
+
+    if [ -n "$audio_codec_map_entries" ]; then
+        while IFS= read -r entry; do
+            [ -n "$entry" ] || continue
+            printf '%s\n' "$entry" >> "$tmp"
+        done <<< "$audio_codec_map_entries"
+    fi
+
+    printf '\n' >> "$tmp"
     mv "$tmp" "$CONFIG_FILE"
 }
 
@@ -280,6 +420,8 @@ write_paths() {
         "$(read_output_extension)" \
         "$(read_video_codec)" \
         "$(read_audio_codec)" \
+        "$(read_video_codec_map_entries_blob)" \
+        "$(read_audio_codec_map_entries_blob)" \
         "$@"
 }
 
@@ -292,6 +434,8 @@ write_mode() {
         "$(read_output_extension)" \
         "$(read_video_codec)" \
         "$(read_audio_codec)" \
+        "$(read_video_codec_map_entries_blob)" \
+        "$(read_audio_codec_map_entries_blob)" \
         "${_paths[@]}"
 }
 
@@ -305,6 +449,8 @@ write_keep_original_days() {
         "$(read_output_extension)" \
         "$(read_video_codec)" \
         "$(read_audio_codec)" \
+        "$(read_video_codec_map_entries_blob)" \
+        "$(read_audio_codec_map_entries_blob)" \
         "${_paths[@]}"
 }
 
@@ -318,6 +464,8 @@ write_input_extensions_csv() {
         "$(read_output_extension)" \
         "$(read_video_codec)" \
         "$(read_audio_codec)" \
+        "$(read_video_codec_map_entries_blob)" \
+        "$(read_audio_codec_map_entries_blob)" \
         "${_paths[@]}"
 }
 
@@ -331,6 +479,8 @@ write_output_extension() {
         "$output_extension" \
         "$(read_video_codec)" \
         "$(read_audio_codec)" \
+        "$(read_video_codec_map_entries_blob)" \
+        "$(read_audio_codec_map_entries_blob)" \
         "${_paths[@]}"
 }
 
@@ -344,6 +494,8 @@ write_video_codec() {
         "$(read_output_extension)" \
         "$video_codec" \
         "$(read_audio_codec)" \
+        "$(read_video_codec_map_entries_blob)" \
+        "$(read_audio_codec_map_entries_blob)" \
         "${_paths[@]}"
 }
 
@@ -357,7 +509,86 @@ write_audio_codec() {
         "$(read_output_extension)" \
         "$(read_video_codec)" \
         "$audio_codec" \
+        "$(read_video_codec_map_entries_blob)" \
+        "$(read_audio_codec_map_entries_blob)" \
         "${_paths[@]}"
+}
+
+write_video_codec_map_entries_blob() {
+    local video_codec_map_entries="$1"
+    _load_paths
+    write_full_config \
+        "$(read_mode)" \
+        "$(read_keep_original_days)" \
+        "$(read_input_extensions_csv)" \
+        "$(read_output_extension)" \
+        "$(read_video_codec)" \
+        "$(read_audio_codec)" \
+        "$video_codec_map_entries" \
+        "$(read_audio_codec_map_entries_blob)" \
+        "${_paths[@]}"
+}
+
+write_audio_codec_map_entries_blob() {
+    local audio_codec_map_entries="$1"
+    _load_paths
+    write_full_config \
+        "$(read_mode)" \
+        "$(read_keep_original_days)" \
+        "$(read_input_extensions_csv)" \
+        "$(read_output_extension)" \
+        "$(read_video_codec)" \
+        "$(read_audio_codec)" \
+        "$(read_video_codec_map_entries_blob)" \
+        "$audio_codec_map_entries" \
+        "${_paths[@]}"
+}
+
+upsert_codec_map_entry_in_blob() {
+    local existing_blob="$1"
+    local new_entry="$2"
+    local target_input="${new_entry%%=*}"
+    local result=""
+    local line=""
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if [ "${line%%=*}" != "$target_input" ]; then
+            if [ -n "$result" ]; then
+                result="${result}"$'\n'"${line}"
+            else
+                result="${line}"
+            fi
+        fi
+    done <<< "$existing_blob"
+
+    if [ -n "$result" ]; then
+        result="${result}"$'\n'"${new_entry}"
+    else
+        result="${new_entry}"
+    fi
+
+    printf '%s\n' "$result"
+}
+
+remove_codec_map_entry_from_blob() {
+    local existing_blob="$1"
+    local target_input="$2"
+    local result=""
+    local line=""
+
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if [ "${line%%=*}" != "$target_input" ]; then
+            if [ -n "$result" ]; then
+                result="${result}"$'\n'"${line}"
+            else
+                result="${line}"
+            fi
+        fi
+    done <<< "$existing_blob"
+
+    printf '%s\n' "$result"
 }
 
 retention_marker_path() {
@@ -532,13 +763,71 @@ output_supports_faststart() {
     esac
 }
 
+detect_stream_codec() {
+    local source_path="$1"
+    local stream_selector="$2"
+    [ -n "$FFPROBE" ] || return 0
+
+    "$FFPROBE" \
+        -v error \
+        -select_streams "$stream_selector" \
+        -show_entries stream=codec_name \
+        -of default=nokey=1:noprint_wrappers=1 \
+        "$source_path" 2>/dev/null | head -1
+}
+
+lookup_codec_override() {
+    local source_codec="$1"
+    shift
+    local total="$#"
+    [ -n "$source_codec" ] || return 1
+    [ "$total" -gt 0 ] || return 1
+
+    local half=$(( total / 2 ))
+    local idx
+    for (( idx=0; idx<half; idx++ )); do
+        if [ "$source_codec" = "${@:$(( idx + 1 )):1}" ]; then
+            echo "${@:$(( half + idx + 1 )):1}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+resolve_video_codec() {
+    local source_path="$1"
+    local default_codec="$2"
+    local source_codec override_codec
+    source_codec="$(detect_stream_codec "$source_path" "v:0")"
+    if [ "$_video_codec_map_count" -gt 0 ]; then
+        override_codec="$(lookup_codec_override "$source_codec" "${_video_codec_map_inputs[@]}" "${_video_codec_map_outputs[@]}" || true)"
+    else
+        override_codec=""
+    fi
+    echo "${override_codec:-$default_codec}"
+}
+
+resolve_audio_codec() {
+    local source_path="$1"
+    local default_codec="$2"
+    local source_codec override_codec
+    source_codec="$(detect_stream_codec "$source_path" "a:0")"
+    if [ "$_audio_codec_map_count" -gt 0 ]; then
+        override_codec="$(lookup_codec_override "$source_codec" "${_audio_codec_map_inputs[@]}" "${_audio_codec_map_outputs[@]}" || true)"
+    else
+        override_codec=""
+    fi
+    echo "${override_codec:-$default_codec}"
+}
+
 convert_one_file() {
     local source_path="$1"
     local output_extension="$2"
     local video_codec="$3"
     local audio_codec="$4"
     local keep_original_days="$5"
-    local source_extension output_path
+    local source_extension output_path effective_video_codec effective_audio_codec
 
     source_extension="$(file_extension "$source_path")"
     [ -n "$source_extension" ] || return 0
@@ -552,12 +841,15 @@ convert_one_file() {
     output_path="${source_path%.*}.${output_extension}"
     [ -f "$output_path" ] && return 0
 
+    effective_video_codec="$(resolve_video_codec "$source_path" "$video_codec")"
+    effective_audio_codec="$(resolve_audio_codec "$source_path" "$audio_codec")"
+
     local ffmpeg_args=(
         -nostdin
         -y
         -i "$source_path"
-        -c:v "$video_codec"
-        -c:a "$audio_codec"
+        -c:v "$effective_video_codec"
+        -c:a "$effective_audio_codec"
     )
 
     if output_supports_faststart "$output_extension"; then
@@ -590,6 +882,12 @@ do_convert() {
 
     _load_paths
     _load_input_extensions
+    _load_video_codec_map
+    _load_audio_codec_map
+
+    if { [ "$_video_codec_map_count" -gt 0 ] || [ "$_audio_codec_map_count" -gt 0 ]; } && [ -z "$FFPROBE" ]; then
+        die "ffprobe not found. Install it with ffmpeg to use codec mapping rules"
+    fi
 
     local dir=""
     for dir in "${_paths[@]}"; do
@@ -626,8 +924,14 @@ Options:
   --keep-original-days <days>    Keep originals for N days before deletion
   --input-extensions <list>      Comma-separated input extensions (example: mov,mkv,avi)
   --output-extension <ext>       Output container extension (default: mp4)
-  --video-codec <codec>          ffmpeg video codec (default: copy)
-  --audio-codec <codec>          ffmpeg audio codec (default: copy)
+  --video-codec <codec>          Default ffmpeg video codec (default: copy)
+  --audio-codec <codec>          Default ffmpeg audio codec (default: copy)
+  --map-video-codec <in=out>     Override video codec for detected source codecs
+  --map-audio-codec <in=out>     Override audio codec for detected source codecs
+  --remove-video-codec-map <in>  Remove one video codec override
+  --remove-audio-codec-map <in>  Remove one audio codec override
+  --clear-video-codec-maps       Remove all video codec overrides
+  --clear-audio-codec-maps       Remove all audio codec overrides
 EOF
 }
 
@@ -703,8 +1007,29 @@ cmd_list() {
     echo "Keep originals: $(read_keep_original_days) day(s)"
     echo "Input extensions: $(read_input_extensions_csv)"
     echo "Output extension: .$(read_output_extension)"
-    echo "Video codec: $(read_video_codec)"
-    echo "Audio codec: $(read_audio_codec)"
+    echo "Default video codec: $(read_video_codec)"
+    echo "Default audio codec: $(read_audio_codec)"
+    echo "Video codec overrides:"
+    local entry
+    local has_video_codec_overrides=false
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        has_video_codec_overrides=true
+        echo "  ${entry}"
+    done < <(read_video_codec_map_entries)
+    if ! $has_video_codec_overrides; then
+        echo "  (none)"
+    fi
+    echo "Audio codec overrides:"
+    local has_audio_codec_overrides=false
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        has_audio_codec_overrides=true
+        echo "  ${entry}"
+    done < <(read_audio_codec_map_entries)
+    if ! $has_audio_codec_overrides; then
+        echo "  (none)"
+    fi
 }
 
 cmd_config() {
@@ -762,7 +1087,7 @@ cmd_config() {
                 normalized_video_codec="$(normalize_codec "$2")"
                 [ -n "$normalized_video_codec" ] || die "--video-codec must not be empty"
                 write_video_codec "$normalized_video_codec"
-                echo "video_codec set to: $normalized_video_codec"
+                echo "default video codec set to: $normalized_video_codec"
                 changed=true
                 shift 2
                 ;;
@@ -772,9 +1097,59 @@ cmd_config() {
                 normalized_audio_codec="$(normalize_codec "$2")"
                 [ -n "$normalized_audio_codec" ] || die "--audio-codec must not be empty"
                 write_audio_codec "$normalized_audio_codec"
-                echo "audio_codec set to: $normalized_audio_codec"
+                echo "default audio codec set to: $normalized_audio_codec"
                 changed=true
                 shift 2
+                ;;
+            --map-video-codec)
+                [ $# -ge 2 ] || die "missing value for --map-video-codec"
+                local normalized_video_codec_map_entry
+                normalized_video_codec_map_entry="$(normalize_codec_map_entry "$2")" || die "--map-video-codec must look like input_codec=output_codec"
+                write_video_codec_map_entries_blob "$(upsert_codec_map_entry_in_blob "$(read_video_codec_map_entries_blob)" "$normalized_video_codec_map_entry")"
+                echo "video codec override set: $normalized_video_codec_map_entry"
+                changed=true
+                shift 2
+                ;;
+            --map-audio-codec)
+                [ $# -ge 2 ] || die "missing value for --map-audio-codec"
+                local normalized_audio_codec_map_entry
+                normalized_audio_codec_map_entry="$(normalize_codec_map_entry "$2")" || die "--map-audio-codec must look like input_codec=output_codec"
+                write_audio_codec_map_entries_blob "$(upsert_codec_map_entry_in_blob "$(read_audio_codec_map_entries_blob)" "$normalized_audio_codec_map_entry")"
+                echo "audio codec override set: $normalized_audio_codec_map_entry"
+                changed=true
+                shift 2
+                ;;
+            --remove-video-codec-map)
+                [ $# -ge 2 ] || die "missing value for --remove-video-codec-map"
+                local removed_video_codec_input
+                removed_video_codec_input="$(normalize_codec_map_key "$2")"
+                [ -n "$removed_video_codec_input" ] || die "--remove-video-codec-map must not be empty"
+                write_video_codec_map_entries_blob "$(remove_codec_map_entry_from_blob "$(read_video_codec_map_entries_blob)" "$removed_video_codec_input")"
+                echo "video codec override removed: $removed_video_codec_input"
+                changed=true
+                shift 2
+                ;;
+            --remove-audio-codec-map)
+                [ $# -ge 2 ] || die "missing value for --remove-audio-codec-map"
+                local removed_audio_codec_input
+                removed_audio_codec_input="$(normalize_codec_map_key "$2")"
+                [ -n "$removed_audio_codec_input" ] || die "--remove-audio-codec-map must not be empty"
+                write_audio_codec_map_entries_blob "$(remove_codec_map_entry_from_blob "$(read_audio_codec_map_entries_blob)" "$removed_audio_codec_input")"
+                echo "audio codec override removed: $removed_audio_codec_input"
+                changed=true
+                shift 2
+                ;;
+            --clear-video-codec-maps)
+                write_video_codec_map_entries_blob ""
+                echo "video codec overrides cleared"
+                changed=true
+                shift
+                ;;
+            --clear-audio-codec-maps)
+                write_audio_codec_map_entries_blob ""
+                echo "audio codec overrides cleared"
+                changed=true
+                shift
                 ;;
             --help|-h)
                 print_config_usage
@@ -849,13 +1224,21 @@ Config options:
   --keep-original-days <days>    Keep originals for N days before deletion
   --input-extensions <list>      Comma-separated input extensions (default: mov)
   --output-extension <ext>       Output container extension (default: mp4)
-  --video-codec <codec>          ffmpeg video codec (default: copy)
-  --audio-codec <codec>          ffmpeg audio codec (default: copy)
+  --video-codec <codec>          Default ffmpeg video codec (default: copy)
+  --audio-codec <codec>          Default ffmpeg audio codec (default: copy)
+  --map-video-codec <in=out>     Override video codec by detected source codec
+  --map-audio-codec <in=out>     Override audio codec by detected source codec
+  --remove-video-codec-map <in>  Remove one video codec override
+  --remove-audio-codec-map <in>  Remove one audio codec override
+  --clear-video-codec-maps       Remove all video codec overrides
+  --clear-audio-codec-maps       Remove all audio codec overrides
 
 Examples:
   mac-mp4-screen-rec add ~/Desktop
   mac-mp4-screen-rec config --all-files --input-extensions mov,mkv --output-extension mp4
   mac-mp4-screen-rec config --video-codec libx264 --audio-codec aac
+  mac-mp4-screen-rec config --map-video-codec hevc=libx264
+  mac-mp4-screen-rec config --map-audio-codec pcm_s16le=aac
   mac-mp4-screen-rec config --keep-original-days 7
   mac-mp4-screen-rec convert
 EOF

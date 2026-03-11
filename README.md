@@ -79,10 +79,37 @@ Scan more than `.mov` and still write `.mp4`:
 mac-mp4-screen-rec config --all-files --input-extensions mov,mkv,avi --output-extension mp4
 ```
 
-Re-encode instead of stream-copying:
+Set global fallback codecs for all matching files:
 
 ```bash
 mac-mp4-screen-rec config --video-codec libx264 --audio-codec aac
+```
+
+Override codecs only when the detected source codec matches:
+
+```bash
+mac-mp4-screen-rec config --map-video-codec hevc=libx264
+mac-mp4-screen-rec config --map-audio-codec pcm_s16le=aac
+```
+
+Those overrides are layered on top of the global defaults. If you only customize one or two settings, the others stay on their defaults or whatever you already set. Example:
+
+```bash
+mac-mp4-screen-rec config --video-codec copy --audio-codec copy
+mac-mp4-screen-rec config --map-video-codec hevc=libx264
+```
+
+In that setup:
+
+- HEVC video is transcoded to H.264
+- Non-HEVC video stays on the default `copy`
+- Audio stays on the default `copy` unless you add an audio override
+
+Remove or clear codec-specific overrides:
+
+```bash
+mac-mp4-screen-rec config --remove-video-codec-map hevc
+mac-mp4-screen-rec config --clear-audio-codec-maps
 ```
 
 Show the active configuration:
@@ -112,9 +139,16 @@ input_extensions: mov
 # Output container extension
 output_extension: mp4
 
-# ffmpeg codec settings
+# Default ffmpeg codec settings
 video_codec: copy
 audio_codec: copy
+
+# Per-source codec overrides (format: input_codec=output_codec)
+video_codec_map:
+hevc=libx264
+
+audio_codec_map:
+pcm_s16le=aac
 ```
 
 ## How It Works
@@ -123,13 +157,17 @@ audio_codec: copy
 2. The same agent also runs once an hour with `StartInterval`, so delayed original cleanup does not depend on fresh file activity.
 3. Each run scans the watched directory roots for files whose extension matches `input_extensions`.
 4. In `recordings-only` mode, only files named `Screen Recording*` are converted.
-5. `ffmpeg` writes a sibling output file using the configured output extension and codecs.
-6. On success, the original is either deleted immediately or tracked for later deletion after `keep_original_days`.
+5. The global `video_codec` and `audio_codec` act as fallbacks.
+6. If codec-specific overrides are configured, `ffprobe` detects the first video and audio stream codecs and matching overrides replace the global defaults for that file.
+7. `ffmpeg` writes a sibling output file using the configured output extension and the resolved codecs.
+8. On success, the original is either deleted immediately or tracked for later deletion after `keep_original_days`.
 
 ## Viability Notes
 
 - Input type support is intentionally delegated to `ffmpeg`. If `ffmpeg` can decode the source and mux the requested output with the chosen codecs, this tool can drive it.
-- Output codec support is also delegated to `ffmpeg`. The script stores codec names verbatim and passes them through as `-c:v` and `-c:a`.
+- Codec-specific overrides are matched against the detected source stream codec names reported by `ffprobe`.
+- Untouched settings remain on defaults. This tool does not try to auto-invent codec/container compatibility rules beyond your config.
+- If a chosen codec/container combination is invalid, `ffmpeg` is the source of truth and that conversion fails.
 - Same-extension transcodes are intentionally skipped. This tool always writes a sibling output file, and in-place rewrites would need a separate naming and retention strategy.
 - Delayed original deletion is approximate, not to-the-second. With the current `launchd` schedule it happens on the next file event or within about one hour of expiry.
 
@@ -168,7 +206,7 @@ brew untap arch1904/mac-mp4-screen-rec
 ## Requirements
 
 - macOS 12+
-- [ffmpeg](https://ffmpeg.org/)
+- [ffmpeg](https://ffmpeg.org/) (includes `ffprobe`)
 
 ## License
 

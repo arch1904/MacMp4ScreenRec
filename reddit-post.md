@@ -27,12 +27,15 @@ macOS saves screen recordings as `.mov`, and a lot of people immediately need `.
 - Convert all matching files instead of only `Screen Recording*`
 - Choose which input extensions to scan (`mov,mkv,avi`, etc.)
 - Choose the output extension and the ffmpeg video/audio codecs
+- Override video/audio codecs only when the source file codec matches a rule
 
 Examples:
 
 ```bash
 mac-mp4-screen-rec config --all-files --input-extensions mov,mkv --output-extension mp4
 mac-mp4-screen-rec config --video-codec libx264 --audio-codec aac
+mac-mp4-screen-rec config --map-video-codec hevc=libx264
+mac-mp4-screen-rec config --map-audio-codec pcm_s16le=aac
 mac-mp4-screen-rec config --keep-original-days 7
 ```
 

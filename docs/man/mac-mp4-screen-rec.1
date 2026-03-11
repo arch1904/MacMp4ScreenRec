@@ -30,7 +30,7 @@ and
 .Fl c:a copy ,
 and deletes the original immediately after a successful conversion.
 .Sh COMMANDS
-.Bl -tag -width "config --keep-original-days 999"
+.Bl -tag -width "config --remove-audio-codec-map pcm_s16le"
 .It Ic add Ar path
 Add a watched directory.
 .It Ic remove Ar path
@@ -58,15 +58,29 @@ Comma-separated list of input file extensions to scan for.
 .It Ic config Fl -output-extension Ar ext
 Output container extension to write.
 .It Ic config Fl -video-codec Ar codec
-Codec name passed to
+Default codec name passed to
 .Xr ffmpeg 1
 as
 .Fl c:v .
 .It Ic config Fl -audio-codec Ar codec
-Codec name passed to
+Default codec name passed to
 .Xr ffmpeg 1
 as
 .Fl c:a .
+.It Ic config Fl -map-video-codec Ar input=output
+Override the output video codec when the detected source video codec matches
+.Ar input .
+.It Ic config Fl -map-audio-codec Ar input=output
+Override the output audio codec when the detected source audio codec matches
+.Ar input .
+.It Ic config Fl -remove-video-codec-map Ar input
+Remove one video codec override.
+.It Ic config Fl -remove-audio-codec-map Ar input
+Remove one audio codec override.
+.It Ic config Fl -clear-video-codec-maps
+Remove all video codec overrides.
+.It Ic config Fl -clear-audio-codec-maps
+Remove all audio codec overrides.
 .It Ic convert
 Run one immediate scan and cleanup pass without waiting for
 .Xr launchd 8 .
@@ -104,17 +118,27 @@ Comma-separated list of file extensions to scan.
 .It Ic output_extension
 Extension used for sibling output files.
 .It Ic video_codec
-Codec passed as
+Fallback codec passed as
 .Fl c:v .
 .It Ic audio_codec
-Codec passed as
+Fallback codec passed as
 .Fl c:a .
+.It Ic video_codec_map
+Optional codec-specific video overrides in
+.Ar input=output
+form.
+.It Ic audio_codec_map
+Optional codec-specific audio overrides in
+.Ar input=output
+form.
 .El
 .Sh EXAMPLES
 .Bd -literal -offset indent
 mac-mp4-screen-rec add ~/Desktop
 mac-mp4-screen-rec config --all-files --input-extensions mov,mkv --output-extension mp4
-mac-mp4-screen-rec config --video-codec libx264 --audio-codec aac
+mac-mp4-screen-rec config --video-codec copy --audio-codec copy
+mac-mp4-screen-rec config --map-video-codec hevc=libx264
+mac-mp4-screen-rec config --map-audio-codec pcm_s16le=aac
 mac-mp4-screen-rec config --keep-original-days 7
 mac-mp4-screen-rec start
 .Ed
@@ -126,6 +150,10 @@ Input type and codec viability is delegated to
 If
 .Xr ffmpeg 1
 can decode the source and mux or encode the requested output, this tool can drive it.
+.It
+Codec-specific overrides are matched against source stream codec names reported by
+.Xr ffprobe 1 .
+Untouched settings stay on their configured defaults.
 .It
 The background job uses both
 .Ic WatchPaths
@@ -152,5 +180,6 @@ agent.
 .Ex -std
 .Sh SEE ALSO
 .Xr ffmpeg 1 ,
+.Xr ffprobe 1 ,
 .Xr launchd 8 ,
 .Xr launchd.plist 5
