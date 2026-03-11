@@ -1,12 +1,19 @@
 # MacMp4ScreenRec
 
-Automatically convert macOS screen recordings from MOV to MP4 — losslessly, in the background.
+Automatically convert macOS screen recordings and other video files in the background with `ffmpeg`.
 
-macOS saves screen recordings as `.mov` files. This tool watches your directories and instantly remuxes them to `.mp4` with zero quality loss using ffmpeg. The original `.mov` is deleted after conversion.
+The current defaults stay the same:
+
+- Watch `~/Desktop`
+- Only convert files named `Screen Recording*`
+- Scan for `.mov`
+- Write `.mp4`
+- Use `-c:v copy -c:a copy`
+- Delete the original immediately after a successful conversion
 
 ## Install
 
-### Homebrew (recommended)
+### Homebrew
 
 ```bash
 brew tap arch1904/mac-mp4-screen-rec
@@ -16,7 +23,7 @@ brew install mac-mp4-screen-rec
 ### Manual
 
 ```bash
-brew install ffmpeg  # required dependency
+brew install ffmpeg
 git clone https://github.com/arch1904/MacMp4ScreenRec.git
 cd MacMp4ScreenRec
 ./install.sh
@@ -25,78 +32,124 @@ cd MacMp4ScreenRec
 ### One-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/arch1904/MacMp4ScreenRec/main/install.sh -o /tmp/install-mac-mp4-screen-rec.sh && curl -fsSL https://raw.githubusercontent.com/arch1904/MacMp4ScreenRec/main/mac-mp4-screen-rec -o /tmp/mac-mp4-screen-rec && chmod +x /tmp/mac-mp4-screen-rec /tmp/install-mac-mp4-screen-rec.sh && cd /tmp && ./install-mac-mp4-screen-rec.sh
+curl -fsSL https://raw.githubusercontent.com/arch1904/MacMp4ScreenRec/main/install.sh -o /tmp/install-mac-mp4-screen-rec.sh && \
+curl -fsSL https://raw.githubusercontent.com/arch1904/MacMp4ScreenRec/main/mac-mp4-screen-rec -o /tmp/mac-mp4-screen-rec && \
+mkdir -p /tmp/docs/man && \
+curl -fsSL https://raw.githubusercontent.com/arch1904/MacMp4ScreenRec/main/docs/man/mac-mp4-screen-rec.1 -o /tmp/docs/man/mac-mp4-screen-rec.1 && \
+chmod +x /tmp/mac-mp4-screen-rec /tmp/install-mac-mp4-screen-rec.sh && \
+cd /tmp && ./install-mac-mp4-screen-rec.sh
 ```
 
 ## Usage
 
 ```bash
-# Watch a directory for screen recordings
 mac-mp4-screen-rec add ~/Desktop
-
-# Watch another directory
 mac-mp4-screen-rec add ~/Documents/Recordings
-
-# Remove a watched directory
 mac-mp4-screen-rec remove ~/Documents/Recordings
-
-# Show current config
 mac-mp4-screen-rec list
-
-# Start/stop the background service
 mac-mp4-screen-rec start
 mac-mp4-screen-rec stop
-
-# Check if service is running
 mac-mp4-screen-rec status
+mac-mp4-screen-rec convert
 ```
 
-### Convert all MOV files (not just screen recordings)
+## Configure Conversion
 
-By default, only files named `Screen Recording*.mov` (macOS default naming) are converted. To convert **all** `.mov` files in watched directories:
+Switch from the default "screen recordings only" behavior to all matching files:
 
 ```bash
-mac-mp4-screen-rec config --all-movs
+mac-mp4-screen-rec config --all-files
 ```
 
-To switch back:
+Go back to macOS-style screen recordings only:
 
 ```bash
 mac-mp4-screen-rec config --only-recordings
 ```
 
-## How it works
+Keep successful originals for 7 days before they are deleted:
 
-1. A lightweight macOS `launchd` service watches your configured directories
-2. When a new `.mov` file appears, the service triggers a conversion
-3. `ffmpeg` remuxes the file to `.mp4` with `-c copy` (no re-encoding, instant, lossless)
-4. The `-movflags +faststart` flag is applied for web-friendly streaming
-5. The original `.mov` file is deleted after successful conversion
-
-The service starts automatically on login and uses macOS native `WatchPaths` — no polling, minimal resource usage.
-
-## Config
-
-The config file lives at `~/.config/mac-mp4-screen-rec/config`:
-
+```bash
+mac-mp4-screen-rec config --keep-original-days 7
 ```
+
+Scan more than `.mov` and still write `.mp4`:
+
+```bash
+mac-mp4-screen-rec config --all-files --input-extensions mov,mkv,avi --output-extension mp4
+```
+
+Re-encode instead of stream-copying:
+
+```bash
+mac-mp4-screen-rec config --video-codec libx264 --audio-codec aac
+```
+
+Show the active configuration:
+
+```bash
+mac-mp4-screen-rec config
+```
+
+## Config File
+
+The config lives at `~/.config/mac-mp4-screen-rec/config`:
+
+```yaml
 # Watch paths (one per line, after "paths:" line)
 paths:
 ~/Desktop
 
-# Mode: "recordings-only" or "all-movs"
+# Selection mode: "recordings-only" or "all-files"
 mode: recordings-only
+
+# Keep successfully converted originals for N days before deletion (0 = delete immediately)
+keep_original_days: 0
+
+# Comma-separated input file extensions to scan for
+input_extensions: mov
+
+# Output container extension
+output_extension: mp4
+
+# ffmpeg codec settings
+video_codec: copy
+audio_codec: copy
 ```
 
-You can edit this file directly or use the CLI commands.
+## How It Works
 
-## Why MOV → MP4?
+1. A macOS `launchd` agent watches your configured directories with `WatchPaths`.
+2. The same agent also runs once an hour with `StartInterval`, so delayed original cleanup does not depend on fresh file activity.
+3. Each run scans the watched directory roots for files whose extension matches `input_extensions`.
+4. In `recordings-only` mode, only files named `Screen Recording*` are converted.
+5. `ffmpeg` writes a sibling output file using the configured output extension and codecs.
+6. On success, the original is either deleted immediately or tracked for later deletion after `keep_original_days`.
 
-macOS screen recordings use H.264 video with AAC audio. Both MOV and MP4 are containers based on the ISO Base Media File Format — the actual video/audio streams are identical. Remuxing just rewrites the container metadata, so:
+## Viability Notes
 
-- **Zero quality loss** — streams are copied bit-for-bit
-- **Instant conversion** — no re-encoding needed
-- **Better compatibility** — MP4 is more widely supported for sharing, uploading, and embedding
+- Input type support is intentionally delegated to `ffmpeg`. If `ffmpeg` can decode the source and mux the requested output with the chosen codecs, this tool can drive it.
+- Output codec support is also delegated to `ffmpeg`. The script stores codec names verbatim and passes them through as `-c:v` and `-c:a`.
+- Same-extension transcodes are intentionally skipped. This tool always writes a sibling output file, and in-place rewrites would need a separate naming and retention strategy.
+- Delayed original deletion is approximate, not to-the-second. With the current `launchd` schedule it happens on the next file event or within about one hour of expiry.
+
+## Why MOV → MP4 by Default?
+
+macOS screen recordings are commonly H.264/AAC inside a MOV container. Remuxing them to MP4 with `copy` preserves the streams bit-for-bit while improving compatibility for upload, sharing, and embedding.
+
+## Man Page
+
+After install:
+
+```bash
+man mac-mp4-screen-rec
+```
+
+For unreleased changes from `main`:
+
+```bash
+brew reinstall --HEAD mac-mp4-screen-rec
+```
 
 ## Uninstall
 
@@ -105,7 +158,7 @@ mac-mp4-screen-rec stop
 ./uninstall.sh
 ```
 
-Or if installed via Homebrew:
+Or with Homebrew:
 
 ```bash
 brew uninstall mac-mp4-screen-rec
@@ -114,8 +167,8 @@ brew untap arch1904/mac-mp4-screen-rec
 
 ## Requirements
 
-- macOS 12+ (Monterey or later)
-- [ffmpeg](https://ffmpeg.org/) (`brew install ffmpeg`)
+- macOS 12+
+- [ffmpeg](https://ffmpeg.org/)
 
 ## License
 

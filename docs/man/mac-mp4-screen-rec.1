@@ -1,0 +1,156 @@
+.Dd March 11, 2026
+.Dt MAC-MP4-SCREEN-REC 1
+.Os
+.Sh NAME
+.Nm mac-mp4-screen-rec
+.Nd convert macOS screen recordings and other configured video files with ffmpeg
+.Sh SYNOPSIS
+.Nm
+.Ar command
+.Op options
+.Sh DESCRIPTION
+.Nm
+manages a per-user
+.Xr launchd 8
+agent that watches configured directories, runs
+.Xr ffmpeg 1
+against matching files, and optionally deletes successful source files after a retention window.
+.Pp
+Default behavior watches
+.Pa ~/Desktop ,
+only converts files named
+.Dq Screen Recording*
+with the
+.Pa .mov
+extension, writes sibling
+.Pa .mp4
+files with
+.Fl c:v copy
+and
+.Fl c:a copy ,
+and deletes the original immediately after a successful conversion.
+.Sh COMMANDS
+.Bl -tag -width "config --keep-original-days 999"
+.It Ic add Ar path
+Add a watched directory.
+.It Ic remove Ar path
+Remove a watched directory.
+.It Ic list
+Show the active configuration.
+.It Ic config
+Show the active configuration.
+.It Ic config Fl -all-files
+Convert all files whose extensions match
+.Ic input_extensions .
+.It Ic config Fl -all-movs
+Legacy alias for
+.Fl -all-files .
+.It Ic config Fl -only-recordings
+Only convert files whose names begin with
+.Dq Screen Recording .
+.It Ic config Fl -keep-original-days Ar days
+Keep successful originals for the given number of days before deletion.
+Use
+.Li 0
+to delete originals immediately.
+.It Ic config Fl -input-extensions Ar ext1,ext2,...
+Comma-separated list of input file extensions to scan for.
+.It Ic config Fl -output-extension Ar ext
+Output container extension to write.
+.It Ic config Fl -video-codec Ar codec
+Codec name passed to
+.Xr ffmpeg 1
+as
+.Fl c:v .
+.It Ic config Fl -audio-codec Ar codec
+Codec name passed to
+.Xr ffmpeg 1
+as
+.Fl c:a .
+.It Ic convert
+Run one immediate scan and cleanup pass without waiting for
+.Xr launchd 8 .
+.It Ic start
+Load the background service.
+.It Ic stop
+Unload the background service.
+.It Ic status
+Show service state and current configuration.
+.It Ic help
+Show command help.
+.It Ic version
+Show the installed version.
+.El
+.Sh CONFIGURATION
+The config file is stored at:
+.Pp
+.Pa ~/.config/mac-mp4-screen-rec/config
+.Pp
+Current keys:
+.Bl -tag -width "keep_original_days"
+.It Ic paths
+Watched directories, one per line after the
+.Ic paths:
+header.
+.It Ic mode
+Either
+.Ic recordings-only
+or
+.Ic all-files .
+.It Ic keep_original_days
+Retention window for successful source files.
+.It Ic input_extensions
+Comma-separated list of file extensions to scan.
+.It Ic output_extension
+Extension used for sibling output files.
+.It Ic video_codec
+Codec passed as
+.Fl c:v .
+.It Ic audio_codec
+Codec passed as
+.Fl c:a .
+.El
+.Sh EXAMPLES
+.Bd -literal -offset indent
+mac-mp4-screen-rec add ~/Desktop
+mac-mp4-screen-rec config --all-files --input-extensions mov,mkv --output-extension mp4
+mac-mp4-screen-rec config --video-codec libx264 --audio-codec aac
+mac-mp4-screen-rec config --keep-original-days 7
+mac-mp4-screen-rec start
+.Ed
+.Sh IMPLEMENTATION NOTES
+.Bl -bullet
+.It
+Input type and codec viability is delegated to
+.Xr ffmpeg 1 .
+If
+.Xr ffmpeg 1
+can decode the source and mux or encode the requested output, this tool can drive it.
+.It
+The background job uses both
+.Ic WatchPaths
+and
+.Ic StartInterval .
+The hourly interval exists so delayed source cleanup still runs when no new files arrive.
+.It
+Same-extension transcodes are intentionally skipped because
+.Nm
+always writes a sibling output file and does not rewrite sources in place.
+.El
+.Sh FILES
+.Bl -tag -width "~/.config/mac-mp4-screen-rec/config"
+.It Pa ~/.config/mac-mp4-screen-rec/config
+User configuration.
+.It Pa ~/.config/mac-mp4-screen-rec/retention
+Retention marker files for delayed source cleanup.
+.It Pa ~/Library/LaunchAgents/com.mac-mp4-screen-rec.agent.plist
+User
+.Xr launchd 8
+agent.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Sh SEE ALSO
+.Xr ffmpeg 1 ,
+.Xr launchd 8 ,
+.Xr launchd.plist 5

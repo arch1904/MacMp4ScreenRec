@@ -1,32 +1,143 @@
 #!/bin/bash
 set -euo pipefail
 
-# mac-mp4-screen-rec — Automatically convert macOS screen recordings to MP4
+# mac-mp4-screen-rec — Automatically convert macOS screen recordings and other video files
 # https://github.com/arch1904/MacMp4ScreenRec
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 CONFIG_DIR="${HOME}/.config/mac-mp4-screen-rec"
 CONFIG_FILE="${CONFIG_DIR}/config"
+RETENTION_DIR="${CONFIG_DIR}/retention"
 PLIST_NAME="com.mac-mp4-screen-rec.agent"
 PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
 FFMPEG="$(command -v ffmpeg 2>/dev/null || echo "")"
+CLEANUP_INTERVAL_SECONDS=3600
 
 # ─── Helpers ──────────────────────────────────────────────
 
 die() { echo "error: $1" >&2; exit 1; }
 tildify() { echo "$1" | sed "s|^${HOME}|~|"; }
 
+trim() {
+    echo "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+lower() {
+    echo "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+normalize_extension() {
+    local ext
+    ext="$(trim "$1")"
+    ext="${ext#.}"
+    lower "$ext"
+}
+
+normalize_mode() {
+    case "$(trim "$1")" in
+        recordings-only) echo "recordings-only" ;;
+        all-files|all-movs) echo "all-files" ;;
+        *) echo "recordings-only" ;;
+    esac
+}
+
+is_nonnegative_integer() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+join_by_comma() {
+    local result=""
+    local item
+    for item in "$@"; do
+        [ -n "$item" ] || continue
+        if [ -n "$result" ]; then
+            result="${result},${item}"
+        else
+            result="$item"
+        fi
+    done
+    echo "$result"
+}
+
+normalize_extensions_csv() {
+    local raw="$1"
+    local ext
+    local -a normalized=()
+    local normalized_count=0
+
+    while IFS= read -r ext; do
+        ext="$(normalize_extension "$ext")"
+        [ -n "$ext" ] || continue
+
+        local seen=false
+        local existing
+        local idx
+        for (( idx=0; idx<normalized_count; idx++ )); do
+            existing="${normalized[$idx]}"
+            if [ "$existing" = "$ext" ]; then
+                seen=true
+                break
+            fi
+        done
+
+        if ! $seen; then
+            normalized+=("$ext")
+            normalized_count=$(( normalized_count + 1 ))
+        fi
+    done < <(printf '%s\n' "$raw" | tr ',[:space:]' '\n')
+
+    [ "$normalized_count" -gt 0 ] || return 1
+    join_by_comma "${normalized[@]}"
+}
+
+normalize_codec() {
+    trim "$1"
+}
+
+read_scalar_config() {
+    local key="$1"
+    local default_value="$2"
+    ensure_config
+
+    local value
+    value=$(grep "^${key}:" "$CONFIG_FILE" | head -1 | sed "s/^${key}:[[:space:]]*//" || true)
+    value="$(trim "${value:-}")"
+
+    if [ -n "$value" ]; then
+        echo "$value"
+    else
+        echo "$default_value"
+    fi
+}
+
 ensure_config() {
+    mkdir -p "$CONFIG_DIR" "$RETENTION_DIR"
+
     if [ ! -f "$CONFIG_FILE" ]; then
-        mkdir -p "$CONFIG_DIR"
         cat > "$CONFIG_FILE" <<'EOF'
 # mac-mp4-screen-rec config
 # Watch paths (one per line, after "paths:" line)
 paths:
 ~/Desktop
 
-# Mode: "recordings-only" or "all-movs"
+# Selection mode: "recordings-only" or "all-files"
 mode: recordings-only
+
+# Keep successfully converted originals for N days before deletion (0 = delete immediately)
+keep_original_days: 0
+
+# Comma-separated input file extensions to scan for
+input_extensions: mov
+
+# Output container extension
+output_extension: mp4
+
+# ffmpeg codec settings
+video_codec: copy
+audio_codec: copy
 EOF
     fi
 }
@@ -34,8 +145,9 @@ EOF
 read_paths() {
     ensure_config
     local in_paths=false
+    local line=""
+
     while IFS= read -r line; do
-        # Skip comments and empty lines
         case "$line" in \#*) continue ;; esac
         [ -z "$line" ] && continue
 
@@ -44,12 +156,10 @@ read_paths() {
             continue
         fi
 
-        # Stop reading paths when we hit another key
-        case "$line" in *:) in_paths=false; continue ;; esac
         case "$line" in *:\ *) in_paths=false; continue ;; esac
+        case "$line" in *:) in_paths=false; continue ;; esac
 
         if $in_paths; then
-            # Expand ~ to $HOME
             echo "${line/#\~/$HOME}"
         fi
     done < "$CONFIG_FILE"
@@ -64,47 +174,262 @@ _load_paths() {
 }
 
 read_mode() {
-    ensure_config
-    local mode
-    mode=$(grep '^mode:' "$CONFIG_FILE" | head -1 | sed 's/^mode:[[:space:]]*//')
-    echo "${mode:-recordings-only}"
+    normalize_mode "$(read_scalar_config "mode" "recordings-only")"
 }
 
-write_paths() {
-    ensure_config
+read_keep_original_days() {
+    local days
+    days="$(read_scalar_config "keep_original_days" "0")"
+    if is_nonnegative_integer "$days"; then
+        echo "$days"
+    else
+        echo "0"
+    fi
+}
+
+read_input_extensions_csv() {
+    local normalized
+    normalized=$(normalize_extensions_csv "$(read_scalar_config "input_extensions" "mov")" || true)
+    echo "${normalized:-mov}"
+}
+
+read_input_extensions() {
+    local csv
+    csv="$(read_input_extensions_csv)"
+    printf '%s\n' "$csv" | tr ',' '\n'
+}
+
+_load_input_extensions() {
+    _input_extensions=()
+    while IFS= read -r _ext; do
+        [ -n "$_ext" ] || continue
+        _input_extensions+=("$_ext")
+    done < <(read_input_extensions)
+}
+
+read_output_extension() {
+    local ext
+    ext="$(normalize_extension "$(read_scalar_config "output_extension" "mp4")")"
+    echo "${ext:-mp4}"
+}
+
+read_video_codec() {
+    local codec
+    codec="$(normalize_codec "$(read_scalar_config "video_codec" "copy")")"
+    echo "${codec:-copy}"
+}
+
+read_audio_codec() {
+    local codec
+    codec="$(normalize_codec "$(read_scalar_config "audio_codec" "copy")")"
+    echo "${codec:-copy}"
+}
+
+write_full_config() {
+    local mode="$1"
+    local keep_original_days="$2"
+    local input_extensions_csv="$3"
+    local output_extension="$4"
+    local video_codec="$5"
+    local audio_codec="$6"
+    shift 6
+    local config_paths=("$@")
     local tmp
     tmp=$(mktemp)
-
-    # Rebuild config preserving mode and comments at top
-    local mode
-    mode=$(read_mode)
 
     cat > "$tmp" <<EOF
 # mac-mp4-screen-rec config
 # Watch paths (one per line, after "paths:" line)
 paths:
 EOF
-    for p in "$@"; do
-        [ -z "$p" ] && continue
-        # Store with ~ for readability
-        tildify "$p" >> "$tmp"
+
+    local path
+    for path in "${config_paths[@]}"; do
+        [ -n "$path" ] || continue
+        tildify "$path" >> "$tmp"
     done
 
     cat >> "$tmp" <<EOF
 
-# Mode: "recordings-only" or "all-movs"
+# Selection mode: "recordings-only" or "all-files"
 mode: ${mode}
+
+# Keep successfully converted originals for N days before deletion (0 = delete immediately)
+keep_original_days: ${keep_original_days}
+
+# Comma-separated input file extensions to scan for
+input_extensions: ${input_extensions_csv}
+
+# Output container extension
+output_extension: ${output_extension}
+
+# ffmpeg codec settings
+video_codec: ${video_codec}
+audio_codec: ${audio_codec}
 EOF
+
     mv "$tmp" "$CONFIG_FILE"
 }
 
+write_paths() {
+    _load_paths
+    write_full_config \
+        "$(read_mode)" \
+        "$(read_keep_original_days)" \
+        "$(read_input_extensions_csv)" \
+        "$(read_output_extension)" \
+        "$(read_video_codec)" \
+        "$(read_audio_codec)" \
+        "$@"
+}
+
 write_mode() {
+    _load_paths
+    write_full_config \
+        "$(normalize_mode "$1")" \
+        "$(read_keep_original_days)" \
+        "$(read_input_extensions_csv)" \
+        "$(read_output_extension)" \
+        "$(read_video_codec)" \
+        "$(read_audio_codec)" \
+        "${_paths[@]}"
+}
+
+write_keep_original_days() {
+    local days="$1"
+    _load_paths
+    write_full_config \
+        "$(read_mode)" \
+        "$days" \
+        "$(read_input_extensions_csv)" \
+        "$(read_output_extension)" \
+        "$(read_video_codec)" \
+        "$(read_audio_codec)" \
+        "${_paths[@]}"
+}
+
+write_input_extensions_csv() {
+    local extensions_csv="$1"
+    _load_paths
+    write_full_config \
+        "$(read_mode)" \
+        "$(read_keep_original_days)" \
+        "$extensions_csv" \
+        "$(read_output_extension)" \
+        "$(read_video_codec)" \
+        "$(read_audio_codec)" \
+        "${_paths[@]}"
+}
+
+write_output_extension() {
+    local output_extension="$1"
+    _load_paths
+    write_full_config \
+        "$(read_mode)" \
+        "$(read_keep_original_days)" \
+        "$(read_input_extensions_csv)" \
+        "$output_extension" \
+        "$(read_video_codec)" \
+        "$(read_audio_codec)" \
+        "${_paths[@]}"
+}
+
+write_video_codec() {
+    local video_codec="$1"
+    _load_paths
+    write_full_config \
+        "$(read_mode)" \
+        "$(read_keep_original_days)" \
+        "$(read_input_extensions_csv)" \
+        "$(read_output_extension)" \
+        "$video_codec" \
+        "$(read_audio_codec)" \
+        "${_paths[@]}"
+}
+
+write_audio_codec() {
+    local audio_codec="$1"
+    _load_paths
+    write_full_config \
+        "$(read_mode)" \
+        "$(read_keep_original_days)" \
+        "$(read_input_extensions_csv)" \
+        "$(read_output_extension)" \
+        "$(read_video_codec)" \
+        "$audio_codec" \
+        "${_paths[@]}"
+}
+
+retention_marker_path() {
+    local source_path="$1"
+    echo "${RETENTION_DIR}/$(md5 -q -s "$source_path").state"
+}
+
+write_retention_marker() {
+    local source_path="$1"
+    local output_path="$2"
+    local keep_original_days="$3"
+    local delete_after_epoch
+    delete_after_epoch=$(( $(date +%s) + (keep_original_days * 86400) ))
+
+    cat > "$(retention_marker_path "$source_path")" <<EOF
+source=${source_path}
+output=${output_path}
+delete_after=${delete_after_epoch}
+EOF
+}
+
+clear_retention_marker() {
+    local marker
+    marker="$(retention_marker_path "$1")"
+    [ -f "$marker" ] && rm -f "$marker"
+}
+
+service_is_loaded() {
+    [ -f "$PLIST_PATH" ] && launchctl list "$PLIST_NAME" &>/dev/null
+}
+
+read_marker_field() {
+    local marker="$1"
+    local field="$2"
+    grep "^${field}=" "$marker" | head -1 | sed "s/^${field}=//" || true
+}
+
+cleanup_retained_originals() {
+    local keep_original_days="$1"
+    local now
+    now=$(date +%s)
+    local marker=""
+
     ensure_config
-    local new_mode="$1"
-    local tmp
-    tmp=$(mktemp)
-    sed "s/^mode:.*/mode: ${new_mode}/" "$CONFIG_FILE" > "$tmp"
-    mv "$tmp" "$CONFIG_FILE"
+
+    for marker in "$RETENTION_DIR"/*.state; do
+        [ -f "$marker" ] || continue
+
+        local source_path output_path delete_after due_after
+        source_path="$(read_marker_field "$marker" "source")"
+        output_path="$(read_marker_field "$marker" "output")"
+        delete_after="$(read_marker_field "$marker" "delete_after")"
+        due_after="$delete_after"
+
+        [ -n "$source_path" ] || { rm -f "$marker"; continue; }
+        [ -f "$source_path" ] || { rm -f "$marker"; continue; }
+        [ -n "$output_path" ] || continue
+        [ -f "$output_path" ] || continue
+
+        if [ "$keep_original_days" -eq 0 ]; then
+            due_after=0
+        fi
+
+        if ! is_nonnegative_integer "${due_after:-}"; then
+            due_after=0
+        fi
+
+        if [ "$now" -ge "$due_after" ]; then
+            rm -f "$source_path"
+            rm -f "$marker"
+        fi
+    done
 }
 
 # ─── Launchd plist generation ─────────────────────────────
@@ -116,9 +441,12 @@ generate_plist() {
         die "no watch paths configured. Add one with: mac-mp4-screen-rec add <path>"
     fi
 
+    mkdir -p "$(dirname "$PLIST_PATH")"
+
     local watch_paths=""
-    for p in "${_paths[@]}"; do
-        watch_paths+="        <string>${p}</string>"$'\n'
+    local path
+    for path in "${_paths[@]}"; do
+        watch_paths+="        <string>${path}</string>"$'\n'
     done
 
     cat > "$PLIST_PATH" <<EOF
@@ -136,6 +464,10 @@ generate_plist() {
     <key>WatchPaths</key>
     <array>
 ${watch_paths}    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>${CLEANUP_INTERVAL_SECONDS}</integer>
     <key>ThrottleInterval</key>
     <integer>5</integer>
 </dict>
@@ -145,63 +477,171 @@ EOF
 
 # ─── Convert logic ────────────────────────────────────────
 
+file_extension() {
+    local name="${1##*/}"
+    case "$name" in
+        *.*) normalize_extension "${name##*.}" ;;
+        *) echo "" ;;
+    esac
+}
+
+file_matches_input_extensions() {
+    local source_path="$1"
+    local current_extension
+    current_extension="$(file_extension "$source_path")"
+    [ -n "$current_extension" ] || return 1
+
+    local wanted_extension
+    for wanted_extension in "${_input_extensions[@]}"; do
+        if [ "$wanted_extension" = "$current_extension" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+file_matches_mode() {
+    local source_path="$1"
+    local mode="$2"
+
+    if [ "$mode" = "recordings-only" ]; then
+        case "$(basename "$source_path")" in
+            "Screen Recording"*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    return 0
+}
+
+file_ready_for_conversion() {
+    local source_path="$1"
+    local now mod_time age
+    now=$(date +%s)
+    mod_time=$(stat -f %m "$source_path" 2>/dev/null || echo "")
+    [ -n "$mod_time" ] || return 1
+    age=$(( now - mod_time ))
+    [ "$age" -ge 3 ]
+}
+
+output_supports_faststart() {
+    case "$1" in
+        mp4|m4v|m4a|mov) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+convert_one_file() {
+    local source_path="$1"
+    local output_extension="$2"
+    local video_codec="$3"
+    local audio_codec="$4"
+    local keep_original_days="$5"
+    local source_extension output_path
+
+    source_extension="$(file_extension "$source_path")"
+    [ -n "$source_extension" ] || return 0
+
+    # This tool produces a sibling output file, so source and output extensions
+    # must differ. Same-extension transcodes need a different naming strategy.
+    if [ "$source_extension" = "$output_extension" ]; then
+        return 0
+    fi
+
+    output_path="${source_path%.*}.${output_extension}"
+    [ -f "$output_path" ] && return 0
+
+    local ffmpeg_args=(
+        -nostdin
+        -y
+        -i "$source_path"
+        -c:v "$video_codec"
+        -c:a "$audio_codec"
+    )
+
+    if output_supports_faststart "$output_extension"; then
+        ffmpeg_args+=(-movflags +faststart)
+    fi
+
+    ffmpeg_args+=("$output_path")
+
+    if "$FFMPEG" "${ffmpeg_args[@]}" >/dev/null 2>&1; then
+        if [ "$keep_original_days" -eq 0 ]; then
+            rm -f "$source_path"
+            clear_retention_marker "$source_path"
+        else
+            write_retention_marker "$source_path" "$output_path" "$keep_original_days"
+        fi
+    fi
+}
+
 do_convert() {
     [ -z "$FFMPEG" ] && die "ffmpeg not found. Install it: brew install ffmpeg"
 
-    local mode
-    mode=$(read_mode)
-    _load_paths
+    local mode keep_original_days output_extension video_codec audio_codec
+    mode="$(read_mode)"
+    keep_original_days="$(read_keep_original_days)"
+    output_extension="$(read_output_extension)"
+    video_codec="$(read_video_codec)"
+    audio_codec="$(read_audio_codec)"
 
+    cleanup_retained_originals "$keep_original_days"
+
+    _load_paths
+    _load_input_extensions
+
+    local dir=""
     for dir in "${_paths[@]}"; do
         [ -d "$dir" ] || continue
 
-        for file in "$dir"/*.mov; do
-            [ -f "$file" ] || continue
+        while IFS= read -r -d '' file; do
+            file_matches_input_extensions "$file" || continue
+            file_matches_mode "$file" "$mode" || continue
+            file_ready_for_conversion "$file" || continue
 
-            # If recordings-only mode, skip non-screen-recordings
-            if [ "$mode" = "recordings-only" ]; then
-                local bname
-                bname="$(basename "$file")"
-                case "$bname" in
-                    "Screen Recording"*) ;;
-                    *) continue ;;
-                esac
-            fi
-
-            # Skip if file was modified in the last 3 seconds (still being written)
-            local now mod_time age
-            now=$(date +%s)
-            mod_time=$(stat -f %m "$file")
-            age=$(( now - mod_time ))
-            if [ "$age" -lt 3 ]; then
-                continue
-            fi
-
-            local mp4_file="${file%.mov}.mp4"
-
-            # Skip if already converted
-            [ -f "$mp4_file" ] && continue
-
-            # Lossless remux
-            if "$FFMPEG" -nostdin -y -i "$file" -c copy -movflags +faststart "$mp4_file" 2>/dev/null; then
-                rm "$file"
-            fi
-        done
+            convert_one_file "$file" "$output_extension" "$video_codec" "$audio_codec" "$keep_original_days"
+        done < <(find "$dir" -maxdepth 1 -type f -print0 2>/dev/null)
     done
+}
+
+restart_service_if_running() {
+    if service_is_loaded; then
+        echo "restarting service to pick up changes..."
+        cmd_stop
+        cmd_start
+    else
+        echo "config updated."
+    fi
+}
+
+print_config_usage() {
+    cat <<EOF
+usage: mac-mp4-screen-rec config [options]
+
+Options:
+  --all-files                    Convert all files matching input_extensions
+  --all-movs                     Legacy alias for --all-files
+  --only-recordings              Only convert Screen Recording* files
+  --keep-original-days <days>    Keep originals for N days before deletion
+  --input-extensions <list>      Comma-separated input extensions (example: mov,mkv,avi)
+  --output-extension <ext>       Output container extension (default: mp4)
+  --video-codec <codec>          ffmpeg video codec (default: copy)
+  --audio-codec <codec>          ffmpeg audio codec (default: copy)
+EOF
 }
 
 # ─── CLI commands ─────────────────────────────────────────
 
 cmd_add() {
     local new_path="${1:?usage: mac-mp4-screen-rec add <path>}"
-    # Resolve to absolute path
     new_path="$(cd "$new_path" 2>/dev/null && pwd)" || die "path does not exist: $1"
 
     _load_paths
 
-    # Check for duplicates
-    for p in "${_paths[@]}"; do
-        if [ "$p" = "$new_path" ]; then
+    local path
+    for path in "${_paths[@]}"; do
+        if [ "$path" = "$new_path" ]; then
             echo "already watching: $(tildify "$new_path")"
             return 0
         fi
@@ -210,13 +650,7 @@ cmd_add() {
     _paths+=("$new_path")
     write_paths "${_paths[@]}"
     echo "added: $(tildify "$new_path")"
-
-    # Regenerate plist if service is running
-    if launchctl list "$PLIST_NAME" &>/dev/null; then
-        echo "restarting service to pick up changes..."
-        cmd_stop
-        cmd_start
-    fi
+    restart_service_if_running
 }
 
 cmd_remove() {
@@ -224,14 +658,15 @@ cmd_remove() {
     rm_path="$(cd "$rm_path" 2>/dev/null && pwd)" || rm_path="${rm_path/#\~/$HOME}"
 
     _load_paths
-    local new_paths=()
+    local -a new_paths=()
     local found=false
+    local path
 
-    for p in "${_paths[@]}"; do
-        if [ "$p" = "$rm_path" ]; then
+    for path in "${_paths[@]}"; do
+        if [ "$path" = "$rm_path" ]; then
             found=true
         else
-            new_paths+=("$p")
+            new_paths+=("$path")
         fi
     done
 
@@ -244,13 +679,9 @@ cmd_remove() {
     else
         write_paths "${new_paths[@]}"
     fi
-    echo "removed: $(tildify "$rm_path")"
 
-    if launchctl list "$PLIST_NAME" &>/dev/null; then
-        echo "restarting service to pick up changes..."
-        cmd_stop
-        cmd_start
-    fi
+    echo "removed: $(tildify "$rm_path")"
+    restart_service_if_running
 }
 
 cmd_list() {
@@ -262,32 +693,101 @@ cmd_list() {
     if [ ${#_paths[@]} -eq 0 ]; then
         echo "  (none)"
     else
-        for p in "${_paths[@]}"; do
-            echo "  $(tildify "$p")"
+        local path
+        for path in "${_paths[@]}"; do
+            echo "  $(tildify "$path")"
         done
     fi
     echo ""
-    echo "Mode: $(read_mode)"
+    echo "Selection mode: $(read_mode)"
+    echo "Keep originals: $(read_keep_original_days) day(s)"
+    echo "Input extensions: $(read_input_extensions_csv)"
+    echo "Output extension: .$(read_output_extension)"
+    echo "Video codec: $(read_video_codec)"
+    echo "Audio codec: $(read_audio_codec)"
 }
 
 cmd_config() {
-    case "${1:-}" in
-        --all-movs)
-            write_mode "all-movs"
-            echo "mode set to: all-movs (converting all .mov files)"
-            ;;
-        --only-recordings)
-            write_mode "recordings-only"
-            echo "mode set to: recordings-only (only Screen Recording*.mov)"
-            ;;
-        *)
-            echo "usage: mac-mp4-screen-rec config [--all-movs | --only-recordings]"
-            exit 1
-            ;;
-    esac
+    [ $# -gt 0 ] || {
+        cmd_list
+        return 0
+    }
 
-    if launchctl list "$PLIST_NAME" &>/dev/null; then
-        echo "service is running — changes take effect on next trigger."
+    local changed=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all-files|--all-movs)
+                write_mode "all-files"
+                echo "selection mode set to: all-files"
+                changed=true
+                shift
+                ;;
+            --only-recordings)
+                write_mode "recordings-only"
+                echo "selection mode set to: recordings-only"
+                changed=true
+                shift
+                ;;
+            --keep-original-days)
+                [ $# -ge 2 ] || die "missing value for --keep-original-days"
+                is_nonnegative_integer "$2" || die "--keep-original-days must be a non-negative integer"
+                write_keep_original_days "$2"
+                echo "keep_original_days set to: $2"
+                changed=true
+                shift 2
+                ;;
+            --input-extensions)
+                [ $# -ge 2 ] || die "missing value for --input-extensions"
+                local normalized_input_extensions
+                normalized_input_extensions=$(normalize_extensions_csv "$2") || die "--input-extensions must include at least one extension"
+                write_input_extensions_csv "$normalized_input_extensions"
+                echo "input_extensions set to: $normalized_input_extensions"
+                changed=true
+                shift 2
+                ;;
+            --output-extension)
+                [ $# -ge 2 ] || die "missing value for --output-extension"
+                local normalized_output_extension
+                normalized_output_extension="$(normalize_extension "$2")"
+                [ -n "$normalized_output_extension" ] || die "--output-extension must not be empty"
+                write_output_extension "$normalized_output_extension"
+                echo "output_extension set to: $normalized_output_extension"
+                changed=true
+                shift 2
+                ;;
+            --video-codec)
+                [ $# -ge 2 ] || die "missing value for --video-codec"
+                local normalized_video_codec
+                normalized_video_codec="$(normalize_codec "$2")"
+                [ -n "$normalized_video_codec" ] || die "--video-codec must not be empty"
+                write_video_codec "$normalized_video_codec"
+                echo "video_codec set to: $normalized_video_codec"
+                changed=true
+                shift 2
+                ;;
+            --audio-codec)
+                [ $# -ge 2 ] || die "missing value for --audio-codec"
+                local normalized_audio_codec
+                normalized_audio_codec="$(normalize_codec "$2")"
+                [ -n "$normalized_audio_codec" ] || die "--audio-codec must not be empty"
+                write_audio_codec "$normalized_audio_codec"
+                echo "audio_codec set to: $normalized_audio_codec"
+                changed=true
+                shift 2
+                ;;
+            --help|-h)
+                print_config_usage
+                return 0
+                ;;
+            *)
+                die "unknown config option: $1"
+                ;;
+        esac
+    done
+
+    if $changed; then
+        restart_service_if_running
     fi
 }
 
@@ -296,7 +796,7 @@ cmd_start() {
     generate_plist
     launchctl load "$PLIST_PATH" 2>/dev/null || true
 
-    if launchctl list "$PLIST_NAME" &>/dev/null; then
+    if service_is_loaded; then
         echo "service started."
     else
         die "failed to start service"
@@ -304,7 +804,7 @@ cmd_start() {
 }
 
 cmd_stop() {
-    if launchctl list "$PLIST_NAME" &>/dev/null; then
+    if service_is_loaded; then
         launchctl unload "$PLIST_PATH" 2>/dev/null || true
         echo "service stopped."
     else
@@ -313,7 +813,7 @@ cmd_stop() {
 }
 
 cmd_status() {
-    if launchctl list "$PLIST_NAME" &>/dev/null; then
+    if service_is_loaded; then
         echo "service: running"
     else
         echo "service: stopped"
@@ -325,27 +825,39 @@ cmd_status() {
 cmd_help() {
     cat <<EOF
 mac-mp4-screen-rec v${VERSION}
-Automatically convert macOS screen recordings from MOV to MP4.
+Automatically convert macOS screen recordings and other video files with ffmpeg.
 
 Usage:
   mac-mp4-screen-rec <command> [options]
 
 Commands:
-  add <path>             Add a directory to watch
-  remove <path>          Remove a watched directory
-  list                   Show current configuration
-  config --all-movs      Convert all .mov files
-  config --only-recordings  Only convert screen recordings (default)
-  start                  Start the background service
-  stop                   Stop the background service
-  status                 Show service status and config
-  help                   Show this help message
-  version                Show version
+  add <path>                     Add a directory to watch
+  remove <path>                  Remove a watched directory
+  list                           Show current configuration
+  config [options]               Update conversion settings
+  start                          Start the background service
+  stop                           Stop the background service
+  status                         Show service status and config
+  convert                        Run one conversion/cleanup pass immediately
+  help                           Show this help message
+  version                        Show version
+
+Config options:
+  --all-files                    Convert all files matching input_extensions
+  --all-movs                     Legacy alias for --all-files
+  --only-recordings              Only convert Screen Recording* files (default)
+  --keep-original-days <days>    Keep originals for N days before deletion
+  --input-extensions <list>      Comma-separated input extensions (default: mov)
+  --output-extension <ext>       Output container extension (default: mp4)
+  --video-codec <codec>          ffmpeg video codec (default: copy)
+  --audio-codec <codec>          ffmpeg audio codec (default: copy)
 
 Examples:
   mac-mp4-screen-rec add ~/Desktop
-  mac-mp4-screen-rec config --all-movs
-  mac-mp4-screen-rec start
+  mac-mp4-screen-rec config --all-files --input-extensions mov,mkv --output-extension mp4
+  mac-mp4-screen-rec config --video-codec libx264 --audio-codec aac
+  mac-mp4-screen-rec config --keep-original-days 7
+  mac-mp4-screen-rec convert
 EOF
 }
 
