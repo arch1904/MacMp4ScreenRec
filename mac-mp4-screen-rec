@@ -4,14 +4,34 @@ set -euo pipefail
 # mac-mp4-screen-rec — Automatically convert macOS screen recordings and other video files
 # https://github.com/arch1904/MacMp4ScreenRec
 
-VERSION="1.2.0"
+resolve_tool_path() {
+    local tool_name="$1"
+    local resolved_path
+
+    resolved_path="$(command -v "$tool_name" 2>/dev/null || true)"
+    if [ -n "$resolved_path" ]; then
+        echo "$resolved_path"
+        return 0
+    fi
+
+    for resolved_path in "/opt/homebrew/bin/${tool_name}" "/usr/local/bin/${tool_name}"; do
+        if [ -x "$resolved_path" ]; then
+            echo "$resolved_path"
+            return 0
+        fi
+    done
+
+    echo ""
+}
+
+VERSION="1.2.1"
 CONFIG_DIR="${HOME}/.config/mac-mp4-screen-rec"
 CONFIG_FILE="${CONFIG_DIR}/config"
 RETENTION_DIR="${CONFIG_DIR}/retention"
 PLIST_NAME="com.mac-mp4-screen-rec.agent"
 PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_NAME}.plist"
-FFMPEG="$(command -v ffmpeg 2>/dev/null || echo "")"
-FFPROBE="$(command -v ffprobe 2>/dev/null || echo "")"
+FFMPEG="$(resolve_tool_path ffmpeg)"
+FFPROBE="$(resolve_tool_path ffprobe)"
 CLEANUP_INTERVAL_SECONDS=3600
 _video_codec_map_inputs=()
 _video_codec_map_outputs=()
@@ -620,6 +640,24 @@ service_is_loaded() {
     [ -f "$PLIST_PATH" ] && launchctl list "$PLIST_NAME" &>/dev/null
 }
 
+service_state() {
+    if ! service_is_loaded; then
+        echo "stopped"
+        return 0
+    fi
+
+    launchctl print "gui/$(id -u)/${PLIST_NAME}" 2>/dev/null | sed -n 's/^[[:space:]]*state = //p' | head -1
+}
+
+service_last_exit_code() {
+    if ! service_is_loaded; then
+        echo ""
+        return 0
+    fi
+
+    launchctl print "gui/$(id -u)/${PLIST_NAME}" 2>/dev/null | sed -n 's/^[[:space:]]*last exit code = //p' | head -1
+}
+
 read_marker_field() {
     local marker="$1"
     local field="$2"
@@ -692,6 +730,11 @@ generate_plist() {
         <string>$(command -v mac-mp4-screen-rec || echo "$0")</string>
         <string>convert</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <key>WatchPaths</key>
     <array>
 ${watch_paths}    </array>
@@ -1188,10 +1231,22 @@ cmd_stop() {
 }
 
 cmd_status() {
-    if service_is_loaded; then
-        echo "service: running"
-    else
+    local state exit_code
+    state="$(service_state)"
+    exit_code="$(service_last_exit_code)"
+
+    if [ "$state" = "stopped" ]; then
         echo "service: stopped"
+    elif [ "$state" = "not running" ]; then
+        if [ -n "$exit_code" ]; then
+            echo "service: loaded (idle, last exit ${exit_code})"
+        else
+            echo "service: loaded (idle)"
+        fi
+    elif [ -n "$exit_code" ]; then
+        echo "service: ${state} (last exit ${exit_code})"
+    else
+        echo "service: ${state}"
     fi
     echo ""
     cmd_list
